@@ -4,7 +4,6 @@ from scipy import signal
 import logging
 import argparse
 import wave
-import threading
 
 CHUNK = 2048
 FORMAT = pyaudio.paFloat32
@@ -13,299 +12,108 @@ RATE = 44100
 
 logging.basicConfig(level=logging.INFO)
 
-# Global variables for runtime control
-feedback_threshold = 0.7
-notch_frequency = 1000
-notch_q = 30
-echo_decay = 0.5
-
 # Default pitch range for bass drum (in Hz)
 default_min_pitch = 60
 default_max_pitch = 100
 
+def ensure_array(data):
+    """Ensure the input is a numpy array of the correct size."""
+    if np.isscalar(data):
+        return np.full(CHUNK, data, dtype=np.float32)
+    data = np.array(data, dtype=np.float32)
+    if len(data) != CHUNK:
+        return resize_to_chunk(data)
+    return data
+
+def resize_to_chunk(data):
+    """Resize the data to match CHUNK size."""
+    if len(data) > CHUNK:
+        return data[:CHUNK]
+    elif len(data) < CHUNK:
+        return np.pad(data, (0, CHUNK - len(data)), 'constant')
+    return data
+
+def find_loudest_segment(data, segment_length):
+    """Find the loudest segment of the given length in the data."""
+    if len(data) <= segment_length:
+        return data
+    
+    segment_energy = np.array([
+        np.sum(data[i:i+segment_length]**2)
+        for i in range(0, len(data) - segment_length + 1)
+    ])
+    loudest_start = np.argmax(segment_energy)
+    return data[loudest_start:loudest_start+segment_length]
+
 def time_stretch(data, stretch_factor):
-    """Time stretch the audio data."""
-    return signal.resample(data, int(len(data) * stretch_factor))
+    """Time stretch the audio data and return the loudest chunk."""
+    data = ensure_array(data)
+    stretched = signal.resample(data, int(len(data) * stretch_factor))
+    
+    # Find the loudest CHUNK-sized segment
+    loudest_segment = find_loudest_segment(stretched, CHUNK)
+    
+    return resize_to_chunk(loudest_segment)
 
 def transpose_to_low_frequency(data, min_freq, max_freq):
     """Transpose the pitch of the audio data to fit within the specified low frequency range."""
     try:
-        # Compute the STFT of the input
+        data = ensure_array(data)
         f, t, Zxx = signal.stft(data, fs=RATE, nperseg=256)
-        
-        # Compute the magnitude and phase of the STFT
         mag, phase = np.abs(Zxx), np.angle(Zxx)
-        
-        # Create a new magnitude array for the transposed signal
         new_mag = np.zeros_like(mag)
-        
-        # Find the index corresponding to max_freq
         max_freq_index = np.argmax(f > max_freq)
         
-        # Transpose frequencies into the desired range
-        for i in range(mag.shape[1]):  # For each time slice
-            for j in range(max_freq_index):  # Only consider frequencies up to max_freq
+        for i in range(mag.shape[1]):
+            for j in range(max_freq_index):
                 freq = f[j]
                 if freq < min_freq:
                     new_index = int((freq / min_freq) * (max_freq_index * min_freq / max_freq))
                 else:
                     new_index = j
-                
                 new_mag[new_index, i] += mag[j, i]
         
-        # Set all frequencies above max_freq to zero
         new_mag[max_freq_index:, :] = 0
-        
-        # Reconstruct the signal using the new magnitude and original phase
         new_Zxx = new_mag * np.exp(1j * phase)
-        
-        # Inverse STFT to get the time domain signal
         _, transposed = signal.istft(new_Zxx, fs=RATE)
-        
-        # Ensure the output is the same length as the input
-        if len(transposed) > len(data):
-            transposed = transposed[:len(data)]
-        elif len(transposed) < len(data):
-            transposed = np.pad(transposed, (0, len(data) - len(transposed)))
-        
-        return transposed.astype(np.float32)
+        return resize_to_chunk(transposed).astype(np.float32)
     except Exception as e:
         logging.error(f"Error in transpose_to_low_frequency: {str(e)}")
-        return data  # Return original data if processing fails
+        return data
 
 def low_pass_filter(data, cutoff, order=6):
     """Apply a low-pass filter to the audio data."""
+    data = ensure_array(data)
     nyq = 0.5 * RATE
     normal_cutoff = cutoff / nyq
     b, a = signal.butter(order, normal_cutoff, btype='low', analog=False)
     return signal.lfilter(b, a, data)
 
-def constrain_pitch(data, min_freq, max_freq):
-    """Constrain the pitch of the audio data to the specified frequency range."""
-    # Compute the FFT of the input
-    fft = np.fft.rfft(data)
-    freqs = np.fft.rfftfreq(len(data), 1/RATE)
-    
-    # Find the peak frequency
-    peak_freq = freqs[np.argmax(np.abs(fft))]
-    
-    if peak_freq < min_freq:
-        shift_factor = min_freq / peak_freq
-    elif peak_freq > max_freq:
-        shift_factor = max_freq / peak_freq
-    else:
-        return data  # No shift needed
-    
-    return pitch_shift(data, shift_factor)
-
-def onset_detection(data, threshold=0.1):
-    """Detect onsets in the audio data."""
-    if len(data) < 2:
-        return []
-
-    spectrum = np.abs(np.fft.rfft(data))
-    flux = np.sum(np.diff(spectrum, axis=0), axis=-1)
-
-    if len(flux) == 0:
-        return []
-
-    max_flux = np.max(flux)
-    if max_flux > 0:
-        flux = flux / max_flux
-    else:
-        return []
-
-    detection_function = (flux > threshold).astype(int)
-
-    peaks = []
-    for i in range(1, len(detection_function) - 1):
-        if detection_function[i] == 1:
-            if detection_function[i] >= detection_function[i - 1] and detection_function[i] >= detection_function[i + 1]:
-                peaks.append(i)
-
-    return peaks
-
-def bandpass_filter(data, lowcut=100, highcut=8000, order=6):
-    """Apply a bandpass filter to the audio data."""
-    nyq = 0.5 * RATE
-    low = lowcut / nyq
-    high = highcut / nyq
-    b, a = signal.butter(order, [low, high], btype='band')
-    return signal.lfilter(b, a, data)
-
-def transient_shaper(data, attack=5, sustain=50):
-    """Enhance transients in the audio data."""
-    envelope = np.abs(signal.hilbert(data))
-    attack_env = signal.lfilter([1], [1, -np.exp(-1/(RATE * attack/1000))], envelope)
-    sustain_env = signal.lfilter([1], [1, -np.exp(-1/(RATE * sustain/1000))], envelope)
-    transient = np.maximum(0, attack_env - sustain_env)
-    return data + transient * data
-
-def noise_gate(data, threshold=-30, attack=5, release=50):
-    """Apply a noise gate to the audio data."""
-    db = 20 * np.log10(np.abs(data) + 1e-6)
-    mask = np.zeros_like(data)
-    mask[db > threshold] = 1
-    
-    attack_coef = np.exp(-1/(RATE * attack/1000))
-    release_coef = np.exp(-1/(RATE * release/1000))
-    for i in range(1, len(mask)):
-        if mask[i] > mask[i-1]:
-            mask[i] = attack_coef * mask[i-1] + (1-attack_coef) * mask[i]
-        else:
-            mask[i] = release_coef * mask[i-1] + (1-release_coef) * mask[i]
-    
-    return data * mask
-
-def detect_feedback(data, threshold):
-    """Detect potential feedback in the audio data."""
-    rms = np.sqrt(np.mean(data**2))
-    return rms > threshold
-
-def adaptive_notch_filter(data, freq, q):
-    """Apply an adaptive notch filter to reduce a specific frequency."""
-    nyq = 0.5 * RATE
-    freq_normalized = freq / nyq
-    b, a = signal.iirnotch(freq_normalized, q)
-    filtered_data = signal.lfilter(b, a, data)
-    
-    # Adapt the notch frequency based on the energy in the filtered signal
-    fft = np.fft.fft(filtered_data)
-    freqs = np.fft.fftfreq(len(fft), 1/RATE)
-    max_freq = freqs[np.argmax(np.abs(fft))]
-    
-    return filtered_data, max_freq
-
-def limiter(data, threshold=0.95):
-    """Apply a simple limiter to prevent volume spikes."""
-    return np.clip(data, -threshold, threshold)
-
-def echo_cancellation(input_data, output_data, decay):
-    """Apply echo cancellation."""
-    return input_data - decay * output_data
-
-def feedback_suppressor(data, threshold=0.9):
-    """Apply a feedback suppressor."""
-    fft = np.fft.rfft(data)
-    magnitude = np.abs(fft)
-    phase = np.angle(fft)
-    
-    # Reduce magnitude of frequency components above threshold
-    magnitude[magnitude > threshold] *= 0.5
-    
-    suppressed = np.fft.irfft(magnitude * np.exp(1j * phase))
-    return suppressed
-
-last_output = np.zeros(CHUNK)  # Global variable to store last output
-
-def process_audio(input_data, onset_threshold, stretch_factor, min_pitch, max_pitch):
-    global last_output, feedback_threshold, notch_frequency, notch_q, echo_decay
-    
+def process_audio(input_data, stretch_factor, min_pitch, max_pitch):
     try:
-        # Echo cancellation
-        try:
-            echo_cancelled = echo_cancellation(input_data, last_output, echo_decay)
-            logging.info(f"Echo cancelled shape: {echo_cancelled.shape}, dtype: {echo_cancelled.dtype}")
-        except Exception as e:
-            logging.error(f"Error in echo cancellation: {str(e)}")
-            echo_cancelled = input_data  # Fallback to original input
+        # Ensure input is an array
+        input_data = ensure_array(input_data)
+        logging.info(f"Input data shape: {input_data.shape}, dtype: {input_data.dtype}")
 
-        # Feedback suppression
-        try:
-            suppressed = feedback_suppressor(echo_cancelled)
-            logging.info(f"Suppressed shape: {suppressed.shape}, dtype: {suppressed.dtype}")
-        except Exception as e:
-            logging.error(f"Error in feedback suppression: {str(e)}")
-            suppressed = echo_cancelled  # Fallback to echo cancelled
-
-        # Detect feedback
-        if detect_feedback(suppressed, feedback_threshold):
-            logging.warning("Feedback detected!")
-            try:
-                suppressed, peak_freq = adaptive_notch_filter(suppressed, notch_frequency, notch_q)
-                notch_frequency = peak_freq  # Update notch frequency
-            except Exception as e:
-                logging.error(f"Error in adaptive notch filter: {str(e)}")
-
-        # Time stretch
-        try:
-            stretched = time_stretch(suppressed, stretch_factor)
-            logging.info(f"Stretched shape: {stretched.shape}, dtype: {stretched.dtype}")
-        except Exception as e:
-            logging.error(f"Error in time stretching: {str(e)}")
-            stretched = suppressed  # Fallback to suppressed
+        # Time stretch and select loudest segment
+        stretched = time_stretch(input_data, stretch_factor)
+        logging.info(f"Stretched (loudest segment) shape: {stretched.shape}, dtype: {stretched.dtype}")
 
         # Transpose to low frequency
-        try:
-            transposed = transpose_to_low_frequency(stretched, min_pitch, max_pitch)
-            logging.info(f"Transposed shape: {transposed.shape}, dtype: {transposed.dtype}")
-        except Exception as e:
-            logging.error(f"Error in transposing to low frequency: {str(e)}")
-            transposed = stretched  # Fallback to stretched
+        transposed = transpose_to_low_frequency(stretched, min_pitch, max_pitch)
+        logging.info(f"Transposed shape: {transposed.shape}, dtype: {transposed.dtype}")
 
         # Apply low-pass filter
-        try:
-            filtered = low_pass_filter(transposed, max_pitch)
-            logging.info(f"Filtered shape: {filtered.shape}, dtype: {filtered.dtype}")
-        except Exception as e:
-            logging.error(f"Error in low-pass filtering: {str(e)}")
-            filtered = transposed  # Fallback to transposed
+        filtered = low_pass_filter(transposed, max_pitch)
+        filtered = ensure_array(filtered).astype(np.float32)
+        logging.info(f"Filtered shape: {filtered.shape}, dtype: {filtered.dtype}")
 
-        # Detect onsets
-        try:
-            onsets = onset_detection(filtered, threshold=onset_threshold)
-            logging.info(f"Onsets detected: {onsets}")
-        except Exception as e:
-            logging.error(f"Error in onset detection: {str(e)}")
-            onsets = []  # Fallback to empty list
-
-        # Enhance transients
-        try:
-            enhanced = transient_shaper(filtered)
-            logging.info(f"Enhanced shape: {enhanced.shape}, dtype: {enhanced.dtype}")
-        except Exception as e:
-            logging.error(f"Error in transient shaping: {str(e)}")
-            enhanced = filtered  # Fallback to filtered
-
-        # Apply noise gate
-        try:
-            gated = noise_gate(enhanced)
-            logging.info(f"Gated shape: {gated.shape}, dtype: {gated.dtype}")
-        except Exception as e:
-            logging.error(f"Error in noise gating: {str(e)}")
-            gated = enhanced  # Fallback to enhanced
-
-        # Apply limiter
-        try:
-            limited = limiter(gated)
-            logging.info(f"Limited shape: {limited.shape}, dtype: {limited.dtype}")
-        except Exception as e:
-            logging.error(f"Error in limiting: {str(e)}")
-            limited = gated  # Fallback to gated
-
-        last_output = limited  # Store this output for next echo cancellation
-        return limited.astype(np.float32)
+        return filtered
     except Exception as e:
-        logging.error(f"General error in process_audio: {str(e)}")
-        return input_data  # Return original data if processing fails
+        logging.error(f"Error in process_audio: {str(e)}")
+        return input_data
 
-def user_input_thread():
-    global feedback_threshold, notch_frequency, echo_decay
-    while True:
-        command = input("Enter command (f: feedback, n: notch, e: echo, q: quit): ")
-        if command == 'f':
-            feedback_threshold = float(input("Enter new feedback threshold (0-1): "))
-        elif command == 'n':
-            notch_frequency = float(input("Enter new notch frequency (Hz): "))
-        elif command == 'e':
-            echo_decay = float(input("Enter new echo decay (0-1): "))
-        elif command == 'q':
-            print("Quitting...")
-            break
-
-def main(bypass_processing, record_output, onset_threshold, stretch_factor, min_pitch, max_pitch, bandpass_low=100, bandpass_high=8000):
-    global feedback_threshold, notch_frequency, notch_q, echo_decay
-    
+def main(bypass_processing, record_output, stretch_factor, min_pitch, max_pitch):
     p = pyaudio.PyAudio()
 
     info = p.get_host_api_info_by_index(0)
@@ -332,18 +140,14 @@ def main(bypass_processing, record_output, onset_threshold, stretch_factor, min_
                     input_device_index=mic_device_index)
 
     print("* recording")
-    print("Enter 'f' to adjust feedback threshold, 'n' to adjust notch frequency, 'e' to adjust echo decay, or 'q' to quit")
-
-    # Start user input thread
-    input_thread = threading.Thread(target=user_input_thread)
-    input_thread.start()
+    print("Press Ctrl+C to stop the recording")
 
     # Prepare for recording if enabled
     if record_output:
         recorded_frames = []
 
     try:
-        while input_thread.is_alive():
+        while True:
             input_data = np.frombuffer(stream.read(CHUNK), dtype=np.float32)
             
             logging.info(f"Processing audio from {selected_device_info['name']}")
@@ -351,8 +155,7 @@ def main(bypass_processing, record_output, onset_threshold, stretch_factor, min_
             if bypass_processing:
                 output_data = input_data
             else:
-                # Corrected call to process_audio
-                output_data = process_audio(input_data, onset_threshold, stretch_factor, min_pitch, max_pitch)
+                output_data = process_audio(input_data, stretch_factor, min_pitch, max_pitch)
             
             stream.write(output_data.astype(np.float32).tobytes())
             
@@ -380,15 +183,12 @@ def main(bypass_processing, record_output, onset_threshold, stretch_factor, min_
         print(f"Recording saved as {output_filename}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Audio processing script with low frequency focus")
+    parser = argparse.ArgumentParser(description="Audio processing script with loudest segment selection")
     parser.add_argument("--bypass", action="store_true", help="Bypass all processing")
     parser.add_argument("--record", action="store_true", help="Record the output audio")
-    parser.add_argument("--onset_threshold", type=float, default=0.1, help="Threshold for onset detection (default: 0.1)")
     parser.add_argument("--stretch", type=float, default=2.0, help="Time stretch factor (default: 2.0)")
     parser.add_argument("--min_pitch", type=float, default=default_min_pitch, help=f"Minimum output pitch in Hz (default: {default_min_pitch} Hz)")
     parser.add_argument("--max_pitch", type=float, default=default_max_pitch, help=f"Maximum output pitch in Hz (default: {default_max_pitch} Hz)")
-    parser.add_argument("--bandpass_low", type=float, default=100, help="Low cutoff frequency for bandpass filter (default: 100 Hz)")
-    parser.add_argument("--bandpass_high", type=float, default=8000, help="High cutoff frequency for bandpass filter (default: 8000 Hz)")
     args = parser.parse_args()
 
-    main(args.bypass, args.record, args.onset_threshold, args.stretch, args.min_pitch, args.max_pitch, args.bandpass_low, args.bandpass_high)
+    main(args.bypass, args.record, args.stretch, args.min_pitch, args.max_pitch)
