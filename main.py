@@ -5,7 +5,7 @@ import logging
 import argparse
 import wave
 
-CHUNK = 1024
+CHUNK = 2056
 FORMAT = pyaudio.paFloat32
 CHANNELS = 1
 BASE_RATE = 44100  # Standard sample rate
@@ -72,11 +72,8 @@ def process_audio(input_data, input_rate, output_rate, cutoff_freq):
         pitched = change_pitch(input_data, input_rate, output_rate)
         pitched = ensure_array(pitched)
 
-        # Apply low-pass filter
-        filtered = apply_low_pass_filter(pitched, cutoff_freq, output_rate)
-
         # Enhance bass
-        bass_boosted = enhance_bass(filtered, boost_factor=1.5, boost_freq=40, sample_rate=output_rate)
+        bass_boosted = enhance_bass(pitched, boost_factor=8, boost_freq=50, sample_rate=output_rate)
 
         # Apply the input envelope to the processed audio
         result = bass_boosted * (input_envelope / np.max(input_envelope))
