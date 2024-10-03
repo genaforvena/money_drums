@@ -1,12 +1,10 @@
 import pyaudio
 import numpy as np
+import pyrubberband as pyrb
+import scipy.signal as signal
 import logging
 import argparse
-
-CHUNK = 1024
-FORMAT = pyaudio.paFloat32
-CHANNELS = 1
-RATE = 44100
+import time
 
 logging.basicConfig(level=logging.INFO)
 
@@ -24,13 +22,6 @@ def simple_slow_down(data, slow_factor):
     return np.repeat(data, slow_factor)
 
 def process_audio(input_data, pitch_factor, slow_factor=None):
-    try:
-        # Convert input to numpy array
-        audio = np.frombuffer(input_data, dtype=np.float32)
-        
-        # Apply pitch shift
-        pitched = simple_pitch_shift(audio, pitch_factor)
-        
         # Apply slowing if slow_factor is provided
         if slow_factor is not None:
             pitched = simple_slow_down(pitched, slow_factor)
@@ -40,42 +31,25 @@ def process_audio(input_data, pitch_factor, slow_factor=None):
             pitched = pitched[:CHUNK]
         elif len(pitched) < CHUNK:
             pitched = np.pad(pitched, (0, CHUNK - len(pitched)), 'constant')
+        # Apply anti-aliasing filter
+        nyquist = output_rate / 2
+        cutoff = min(nyquist * 0.9, 20000)  # Prevent cutting off all audible frequencies
+        b, a = signal.butter(5, cutoff, fs=output_rate, btype='low')
+        audio = signal.lfilter(b, a, audio)
         
-        return pitched.astype(np.float32)
-    except Exception as e:
-        logging.error(f"Error in process_audio: {str(e)}")
-        return input_data
+        # Pitch shift
+        pitched = pyrb.pitch_shift(audio, output_rate, n_steps=semitones,
+                                   rbargs={'-F':''})       
+        # Upsample back to input rate if necessary
+        if input_rate != output_rate:
+            pitched = signal.resample(pitched, len(input_data) // 4)  # Divide by 4 because input is byte stream
 
 def main(pitch_factor, slow_factor):
-    p = pyaudio.PyAudio()
-
-    # List available input devices
-    info = p.get_host_api_info_by_index(0)
-    numdevices = info.get('deviceCount')
-    for i in range(numdevices):
-        if (p.get_device_info_by_host_api_device_index(0, i).get('maxInputChannels')) > 0:
-            print(f"Input Device id {i} - {p.get_device_info_by_host_api_device_index(0, i).get('name')}")
-
-    # Get user input for device selection
-    device_id = int(input("Enter input device ID: "))
-
-    stream = p.open(format=FORMAT,
-                    channels=CHANNELS,
-                    rate=RATE,
-                    input=True,
-                    output=True,
-                    frames_per_buffer=CHUNK,
-                    input_device_index=device_id)
-
-    print("* recording")
-
-    try:
-        while True:
-            input_data = stream.read(CHUNK)
-            output_data = process_audio(input_data, pitch_factor, slow_factor)
-            stream.write(output_data.tobytes())
+    input_data = stream.read(CHUNK)
+    output_data = process_audio(input_data, pitch_factor, slow_factor)
+    stream.write(output_data.tobytes())
     except KeyboardInterrupt:
-        print("* done recording")
+        print("* Done recording")
     except Exception as e:
         logging.error(f"Error in main loop: {str(e)}")
 
