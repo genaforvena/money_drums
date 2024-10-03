@@ -17,13 +17,23 @@ def simple_pitch_shift(data, pitch_factor):
     indices = np.arange(0, len(data), pitch_factor)
     return np.interp(indices, np.arange(len(data)), data)
 
-def process_audio(input_data, pitch_factor):
+def simple_slow_down(data, slow_factor):
+    """
+    Simple audio slowing by repeating samples.
+    """
+    return np.repeat(data, slow_factor)
+
+def process_audio(input_data, pitch_factor, slow_factor=None):
     try:
         # Convert input to numpy array
         audio = np.frombuffer(input_data, dtype=np.float32)
         
         # Apply pitch shift
         pitched = simple_pitch_shift(audio, pitch_factor)
+        
+        # Apply slowing if slow_factor is provided
+        if slow_factor is not None:
+            pitched = simple_slow_down(pitched, slow_factor)
         
         # Ensure output is the same length as input
         if len(pitched) > CHUNK:
@@ -36,7 +46,7 @@ def process_audio(input_data, pitch_factor):
         logging.error(f"Error in process_audio: {str(e)}")
         return input_data
 
-def main(pitch_factor):
+def main(pitch_factor, slow_factor):
     p = pyaudio.PyAudio()
 
     # List available input devices
@@ -62,7 +72,7 @@ def main(pitch_factor):
     try:
         while True:
             input_data = stream.read(CHUNK)
-            output_data = process_audio(input_data, pitch_factor)
+            output_data = process_audio(input_data, pitch_factor, slow_factor)
             stream.write(output_data.tobytes())
     except KeyboardInterrupt:
         print("* done recording")
@@ -74,8 +84,9 @@ def main(pitch_factor):
     p.terminate()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Simple pitch shift audio processor")
+    parser = argparse.ArgumentParser(description="Simple pitch shift and slow down audio processor")
     parser.add_argument("--pitch", type=float, default=0.5, help="Pitch factor (default: 0.5, lower values = lower pitch)")
+    parser.add_argument("--slow", type=int, help="Slow factor (optional, integer value for sample repetition)")
     args = parser.parse_args()
 
-    main(args.pitch)
+    main(args.pitch, args.slow)
